@@ -1,91 +1,80 @@
 import json
-import base64
-from typing import Any, Callable, Dict
-from io import BytesIO
-from PIL import Image
-from blist import sorteddict
-from contextlib import contextmanager
-import threading
+import os
+import time
+from typing import Any, Dict, List, Tuple, Union
+
+from .index import create_index, search_index
+from .replication import Master, Slave
+
 
 class SimpleDatabase:
-    def __init__(self, db_name: str, shard_count: int = 1):
-        self.db_name = db_name
-        self.shard_count = shard_count
-        self.data = sorteddict()
-        self.locks = [threading.Lock() for _ in range(shard_count)]
-        self._cache = {}
+    def __init__(
+        self,
+        data_path: str = "data.json",
+        replication_master_ip: Union[str, None] = None,
+        replication_master_port: int = 5000,
+    ):
+        self.data_path = data_path
+        self.data: Dict[str, Any] = {}
+        self.replication_master: Union[Master, None] = None
+        self.replication_slave: Union[Slave, None] = None
 
-    def _get_shard_name(self, key: str) -> str:
-        return f"{self.db_name}_shard_{hash(key) % self.shard_count}.json"
+        self.load_data()
 
-    def _load_database(self):
-        self.data = sorteddict()
-        for shard_id in range(self.shard_count):
-            shard_name = f"{self.db_name}_shard_{shard_id}.json"
-            try:
-                with open(shard_name, 'r') as f:
-                    self.data.update(json.loads(f.read()))
-            except FileNotFoundError:
-                pass
-
-    def _save_database(self, shard_name: str):
-        shard_data = {k: v for k, v in self.data.items() if self._get_shard_name(k) == shard_name}
-        with open(shard_name, 'w') as f:
-            f.write(json.dumps(shard_data))
-
-    def _encode_data(self, data: Any) -> str:
-        if isinstance(data, Image.Image):
-            buffered = BytesIO()
-            data.save(buffered, format="PNG")
-            return base64.b64encode(buffered.getvalue()).decode()
+        if replication_master_ip:
+            self.replication_slave = Slave(
+                self, replication_master_ip, replication_master_port
+            )
         else:
-            return json.dumps(data)
+            self.replication_master = Master(self, "0.0.0.0", replication_master_port)
 
-    def _decode_data(self, data: str) -> Any:
-        try:
-            return json.loads(data)
-        except json.JSONDecodeError:
-            try:
-                return Image.open(BytesIO(base64.b64decode(data)))
-            except Exception:
-                return data
+    def load_data(self):
+        if os.path.exists(self.data_path):
+            with open(self.data_path, "r") as f:
+                self.data = json.load(f)
 
-    def insert_data(self, key: str, value: Any):
-        shard_name = self._get_shard_name(key)
-        lock = self.locks[hash(key) % self.shard_count]
-        with lock:
-            self.data[key] = self._encode_data(value)
-            self._cache.clear()
-            self._save_database(shard_name)
+    def save_data(self):
+        with open(self.data_path, "w") as f:
+            json.dump(self.data, f)
 
-    def get_data(self, key: str) -> Any:
-        if key in self._cache:
-            return self._cache[key]
+    def get(self, key: str) -> Any:
+        return self.data.get(key)
 
-        value = self.data.get(key)
-        if value is not None:
-            decoded_value = self._decode_data(value)
-            self._cache[key] = decoded_value
-            return decoded_value
-        return None
+    def set(self, key: str, value: Any):
+        if key not in self.data:
+            self.data[key] = {"_created": time.time()}
 
-    def delete_data(self, key: str):
-        shard_name = self._get_shard_name(key)
-        lock = self.locks[hash(key) % self.shard_count]
-        with lock:
-            if key in self.data:
-                del self.data[key]
-                self._cache.clear()
-                self._save_database(shard_name)
+        self.data[key]["_updated"] = time.time()
+        self.data[key]["_rev"] = self.data.get(key, {}).get("_rev", 0) + 1
+        self.data[key].update(value)
 
-    def query(self, filter_func: Callable[[str, Any], bool]) -> Dict[str, Any]:
-        return {k: self._decode_data(v) for k, v in self.data.items() if filter_func(k, v)}
-    
-    @contextmanager
-    def transaction(self):
-        try:
-            yield
-        finally:
-            for shard_id in range(self.shard_count):
-                shard_name = f"{self.db_name}_shard_{shard_id}.json"
-                self._save_database(shard_name)
+        if self.replication_master:
+            self.replication_master.set_data(key, value)
+        elif self.replication_slave:
+            self.replication_slave.update_data(key, value)
+
+    def delete(self, key: str):
+        if key in self.data:
+            del self.data[key]
+
+        if self.replication_master:
+            for slave in self.replication_master.slaves:
+                slave.delete_data(key)
+
+    def list_keys(self) -> List[str]:
+        return list(self.data.keys())
+
+    def list_values(self) -> List[Any]:
+        return list(self.data.values())
+
+    def create_index(self, column: str):
+        create_index(self.data, column)
+
+    def search_index(self, column: str, value: Any) -> List[str]:
+        return search_index(self.data, column, value)
+
+    def serialize(self, data: Any) -> str:
+        return json.dumps(data)
+
+    def deserialize(self, data: str) -> Any:
+        return json.loads(data)

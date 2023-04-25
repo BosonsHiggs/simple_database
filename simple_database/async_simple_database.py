@@ -1,82 +1,120 @@
 import json
-import base64
+import os
+import time
+from typing import Any, Dict, List, Tuple, Union
+
 import asyncio
-from typing import Any, Callable, Dict
-from io import BytesIO
-from PIL import Image
-from blist import sorteddict
-from contextlib import asynccontextmanager
-import threading
+import aiohttp
+
 
 class AsyncSimpleDatabase:
-    def __init__(self, db_name: str, shard_count: int = 1):
-        self.db_name = db_name
-        self.shard_count = shard_count
-        self.data = sorteddict()
-        self.locks = [asyncio.Lock() for _ in range(shard_count)]
-        self._cache = {}
+    def __init__(
+        self,
+        data_path: str = "data.json",
+        replication_master_ip: Union[str, None] = None,
+        replication_master_port: int = 5000,
+    ):
+        self.data_path = data_path
+        self.data: Dict[str, Any] = {}
+        self.indexes: Dict[str, Dict] = {}
+        self.replication_master: Union[str, None] = replication_master_ip
+        self.replication_master_port = replication_master_port
 
-    def _get_shard_name(self, key: str) -> str:
-        return f"{self.db_name}_shard_{hash(key) % self.shard_count}.json"
+        self.load_data()
 
-    def _load_database(self):
-        self.data = sorteddict()
-        for shard_id in range(self.shard_count):
-            shard_name = f"{self.db_name}_shard_{shard_id}.json"
-            try:
-                with open(shard_name, 'r') as f:
-                    self.data.update(json.loads(f.read()))
-            except FileNotFoundError:
+    async def load_data(self):
+        if os.path.exists(self.data_path):
+            with open(self.data_path, "r") as f:
+                self.data = json.load(f)
+
+            self.create_indexes()
+
+    async def save_data(self):
+        with open(self.data_path, "w") as f:
+            json.dump(self.data, f)
+
+    async def get(self, key: str) -> Any:
+        return self.data.get(key)
+
+    async def set(self, key: str, value: Any):
+        if key not in self.data:
+            self.data[key] = {"_created": time.time()}
+
+        self.data[key]["_updated"] = time.time()
+        self.data[key]["_rev"] = self.data.get(key, {}).get("_rev", 0) + 1
+        self.data[key].update(value)
+
+        if self.replication_master:
+            await self.update_data_on_master(key, value)
+
+    async def delete(self, key: str):
+        if key in self.data:
+            del self.data[key]
+
+        if self.replication_master:
+            await self.delete_data_on_master(key)
+
+    async def list_keys(self) -> List[str]:
+        return list(self.data.keys())
+
+    async def list_values(self) -> List[Any]:
+        return list(self.data.values())
+
+    async def create_index(self, column: str):
+        for key, value in self.data.items():
+            if column in value:
+                await self.update_index_on_master(column, value[column], key)
+
+        self.create_indexes()
+
+    def create_indexes(self):
+        self.indexes = {}
+
+        for key, value in self.data.items():
+            for column, val in value.items():
+                if column not in self.indexes:
+                    self.indexes[column] = {}
+
+                if val not in self.indexes[column]:
+                    self.indexes[column][val] = set()
+
+                self.indexes[column][val].add(key)
+
+    async def search_index(self, column: str, value: Any) -> List[str]:
+        if self.replication_master:
+            return await self.search_index_on_master(column, value)
+
+        return [key for key, data in self.data.items() if data.get(column) == value]
+
+    async def update_data_on_master(self, key: str, value: Any):
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"http://{self.replication_master}:{self.replication_master_port}/set",
+                json={"key": key, "value": value},
+            ) as response:
                 pass
 
-    async def _save_database(self, shard_name: str):
-        shard_data = {k: v for k, v in self.data.items() if self._get_shard_name(k) == shard_name}
-        async with aiofiles.open(shard_name, 'w') as f:
-            await f.write(json.dumps(shard_data))
+    async def delete_data_on_master(self, key: str):
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"http://{self.replication_master}:{self.replication_master_port}/delete",
+                json={"key": key},
+            ) as response:
+                pass
 
-    def _encode_data(self, data: Any) -> str:
-        if isinstance(data, Image.Image):
-            buffered = BytesIO()
-            data.save(buffered, format="PNG")
-            return base64.b64encode(buffered.getvalue()).decode()
-        else:
-            return json.dumps(data)
+    async def update_index_on_master(self, column: str, value: Any, key: str):
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"http://{self.replication_master}:{self.replication_master_port}/create_index",
+                json={"column": column, "value": value, "key": key},
+            ) as response:
+                pass
 
-    def _decode_data(self, data: str) -> Any:
-        try:
-            return json.loads(data)
-        except json.JSONDecodeError:
-            try:
-                return Image.open(BytesIO(base64.b64decode(data)))
-            except Exception:
-                return data
-
-    async def insert_data(self, key: str, value: Any):
-        shard_name = self._get_shard_name(key)
-        lock = self.locks[hash(key) % self.shard_count]
-        async with lock:
-            self.data[key] = self._encode_data(value)
-            self._cache.clear()
-            await self._save_database(shard_name)
-
-    async def get_data(self, key: str) -> Any:
-        if key in self._cache:
-            return self._cache[key]
-
-        value = self.data.get(key)
-        if value is not None:
-            decoded_value = self._decode_data(value)
-            self._cache[key] = decoded_value
-            return decoded_value
-        return None
-
-    async def delete_data(self, key: str):
-        shard_name = self._get_shard_name(key)
-        lock = self.locks[hash(key) % self.shard_count]
-        async with lock:
-            if key in self.data:
-                del self.data[key]
-                self._cache.clear()
-                await self._save_database(shard_name)
-
-    async def query(self, filter_func: Callable[[
+    async def search_index_on_master(self, column: str, value: Any) -> List[str]:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"http://{self.replication_master}:{self.replication_master_port}/search_index",
+                json={"column": column, "value": value},
+            ) as response:
+                result = await response.json()
+                return result["keys"]
