@@ -16,12 +16,18 @@ A lightweight and simple database implementation in Python, designed for small-s
 
 ```lua
 simple_database/
-|-- simple_database/
-|   |-- __init__.py
-|   |-- simple_database.py
-|-- .gitignore
-|-- README.md
-|-- setup.py
+├── simple_database
+│   ├── __init__.py
+│   ├── backup.py
+│   ├── index.py
+│   ├── security.py
+│   ├── simple_database.py
+│   ├── replication.py
+│   ├── transaction.py
+│   └── performance.py
+├── .gitignore
+├── README.md
+└── setup.py
 ```
 
 ## Installation
